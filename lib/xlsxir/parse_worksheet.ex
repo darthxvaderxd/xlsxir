@@ -37,10 +37,10 @@ defmodule Xlsxir.ParseWorksheet do
     tid = GenServer.call(Xlsxir.StateManager, :new_table)
 
     "sheet" <> remained = xml_name
-    {sheet_id, _} = Integer.parse(remained)
+    {rid, _} = Integer.parse(remained)
 
     worksheet_name =
-      List.foldl(:ets.lookup(workbook_tid, sheet_id), nil, fn value, _ ->
+      List.foldl(:ets.lookup(workbook_tid, rid), nil, fn value, _ ->
         case value do
           {_, worksheet_name} -> worksheet_name
           _ -> nil
@@ -65,17 +65,23 @@ defmodule Xlsxir.ParseWorksheet do
 
   def sax_event_handler({:startElement, _, 'c', _, xml_attr}, state, %{styles: styles_tid}, _) do
     a =
-      Enum.reduce(xml_attr, %{}, fn attr, acc ->
+      Enum.map(xml_attr, fn attr ->
         case attr do
-          {:attribute, 's', _, _, style} ->
-            Map.put(acc, "s", find_styles(styles_tid, List.to_integer(style)))
-
-          {:attribute, key, _, _, ref} ->
-            Map.put(acc, to_string(key), ref)
+          {:attribute, 'r', _, _, ref} -> {:r, ref}
+          {:attribute, 's', _, _, style} -> {:s, find_styles(styles_tid, List.to_integer(style))}
+          {:attribute, 't', _, _, type} -> {:t, type}
+          _ -> raise "Unknown cell attribute"
         end
       end)
 
-    {cell_ref, num_style, data_type} = {a["r"], a["s"], a["t"]}
+    {cell_ref, num_style, data_type} =
+      case a |> Keyword.keys() |> Enum.sort() do
+        [:r] -> {a[:r], nil, nil}
+        [:r, :s] -> {a[:r], a[:s], nil}
+        [:r, :t] -> {a[:r], nil, a[:t]}
+        [:r, :s, :t] -> {a[:r], a[:s], a[:t]}
+        _ -> raise "Invalid attributes: #{a}"
+      end
 
     %{state | cell_ref: cell_ref, num_style: num_style, data_type: data_type}
   end
@@ -84,16 +90,9 @@ defmodule Xlsxir.ParseWorksheet do
     %{state | value_type: :formula}
   end
 
-  def sax_event_handler({:startElement, _, el, _, _}, state, _, _) when el in ['v', 't'] do
+  def sax_event_handler({:startElement, _, 'v', _, _}, state, _, _) do
     %{state | value_type: :value}
   end
-
-  def sax_event_handler({:endElement, _, el, _, _}, state, _, _) when el in ['f', 'v', 't'] do
-    %{state | value_type: nil}
-  end
-
-  def sax_event_handler({:startElement, _, 'is', _, _}, state, _, _),
-    do: %{state | value_type: :value}
 
   def sax_event_handler({:characters, value}, state, _, _) do
     case state do
@@ -126,7 +125,7 @@ defmodule Xlsxir.ParseWorksheet do
     unless Enum.empty?(state.row) do
       [[row]] = ~r/\d+/ |> Regex.scan(state.row |> List.first() |> List.first())
       row = row |> String.to_integer()
-      value = state.row |> Enum.reverse() |> fill_nil()
+      value = state.row |> Enum.reverse()
 
       :ets.insert(tid, {row, value})
       if !is_nil(max_rows) and row == max_rows, do: raise(SaxError, state: state)
@@ -136,64 +135,6 @@ defmodule Xlsxir.ParseWorksheet do
   end
 
   def sax_event_handler(_, state, _, _), do: state
-
-  defp fill_nil(rows) do
-    Enum.reduce(rows, {[], nil}, fn [ref, val], {values, previous} ->
-      line = ~r/\d+$/ |> Regex.run(ref) |> List.first()
-
-      empty_cells =
-        cond do
-          is_nil(previous) && String.first(ref) != "A" ->
-            fill_empty_cells("A#{line}", ref, line, [])
-
-          !is_nil(previous) && !is_next_col(ref, previous) ->
-            fill_empty_cells(next_col(previous), ref, line, [])
-
-          true ->
-            []
-        end
-
-      {values ++ empty_cells ++ [[ref, val]], ref}
-    end)
-    |> elem(0)
-  end
-
-  def column_from_index(index, column) when index > 0 do
-    modulo = rem(index - 1, 26)
-    column = [65 + modulo | column]
-    column_from_index(div(index - modulo, 26), column)
-  end
-
-  def column_from_index(_, column), do: to_string(column)
-
-  defp is_next_col(current, previous) do
-    current == next_col(previous)
-  end
-
-  def next_col(ref) do
-    [chars, line] = Regex.run(~r/^([A-Z]+)(\d+)/, ref, capture: :all_but_first)
-    chars = chars |> String.to_charlist()
-
-    col_index =
-      Enum.reduce(chars, 0, fn char, acc ->
-        acc = acc * 26
-        acc + char - 65 + 1
-      end)
-
-    "#{column_from_index(col_index + 1, '')}#{line}"
-  end
-
-  def fill_empty_cells(from, from, _line, cells), do: Enum.reverse(cells)
-
-  def fill_empty_cells(from, to, line, cells) do
-    next_ref = next_col(from)
-
-    if next_ref == to do
-      fill_empty_cells(to, to, line, [[from, nil] | cells])
-    else
-      fill_empty_cells(next_ref, to, line, [[from, nil] | cells])
-    end
-  end
 
   defp format_cell_value(%{shared_strings: strings_tid}, list) do
     case list do
@@ -224,18 +165,7 @@ defmodule Xlsxir.ParseWorksheet do
   end
 
   defp convert_iso_date(value) do
-    str = value |> List.to_string()
-
-    with {:ok, date} <- str |> Date.from_iso8601() do
-      date |> Date.to_erl()
-    else
-      {:error, _} ->
-        with {:ok, datetime} <- str |> NaiveDateTime.from_iso8601() do
-          datetime
-        else
-          {:error, _} -> str
-        end
-    end
+    value |> List.to_string() |> Date.from_iso8601() |> elem(1) |> Date.to_erl()
   end
 
   defp convert_date_or_time(value) do
@@ -254,13 +184,7 @@ defmodule Xlsxir.ParseWorksheet do
     tid
     |> :ets.lookup(index)
     |> List.first()
-    |> case do
-      nil ->
-        nil
-
-      {_, i} ->
-        i
-    end
+    |> elem(1)
   end
 
   defp find_string(nil, _index), do: nil
